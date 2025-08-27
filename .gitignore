@@ -1,3 +1,4 @@
 /.env
 /config
 /gcloud-credentials.json
+/package-lock.json
