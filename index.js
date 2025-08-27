@@ -19,10 +19,7 @@ import { GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI } from '@langchain
 import { QdrantVectorStore } from '@langchain/qdrant';
 
 const startServer = async () => {
-  // Load environment variables from .env file
   dotenv.config();
-
-  // Wait for the DB connection to complete BEFORE starting the server
   await connectDB();
 
   const app = express();
@@ -30,7 +27,7 @@ const startServer = async () => {
   // --- Middleware Setup ---
   const corsOptions = { origin: process.env.CLIENT_URL, optionsSuccessStatus: 200 };
   app.use(cors(corsOptions));
-  app.use(express.json()); // Middleware to parse JSON bodies
+  app.use(express.json());
 
   // --- Multer Setup for file uploads ---
   const storage = multer.diskStorage({
@@ -48,27 +45,29 @@ const startServer = async () => {
       host: process.env.REDIS_HOST,
       port: parseInt(process.env.REDIS_PORT, 10),
       password: process.env.REDIS_PASSWORD,
-      tls: {}, // Required for cloud providers like Upstash
+      tls: {},
     },
   });
 
   // ========== API ENDPOINTS ==========
 
   // --- 1. PDF Upload Endpoint ---
-  // Method: POST, Path: /upload/pdf
   app.post('/upload/pdf', authenticate, upload.single('pdf'), async (req, res) => {
     try {
-      if (!req.file) {
-        return res.status(400).json({ error: 'No file uploaded.' });
-      }
+      if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
       const { originalname, path } = req.file;
-      const userId = req.user._id;
-      const qdrantCollectionName = new mongoose.Types.ObjectId().toHexString();
-      
-      const newDocument = await Document.create({ userId, fileName: originalname, status: 'PENDING', qdrantCollectionName });
-      
-      await queue.add('file-processing-job', { path, documentId: newDocument._id, qdrantCollectionName });
-      
+      const newDocument = await Document.create({
+        userId: req.user._id,
+        fileName: originalname,
+        filePath: path, // Save the file path to the database
+        status: 'PENDING',
+        qdrantCollectionName: new mongoose.Types.ObjectId().toHexString(),
+      });
+      await queue.add('file-processing-job', {
+        path,
+        documentId: newDocument._id,
+        qdrantCollectionName: newDocument.qdrantCollectionName,
+      });
       console.log(`Job added to queue for document: ${newDocument._id}`);
       return res.status(201).json({ message: 'File uploaded and queued for processing.', documentId: newDocument._id });
     } catch (error) {
@@ -78,7 +77,6 @@ const startServer = async () => {
   });
 
   // --- 2. Get All Chat Rooms Endpoint ---
-  // Method: GET, Path: /chatrooms
   app.get('/chatrooms', authenticate, async (req, res) => {
     try {
       const chatRooms = await ChatRoom.find({ userId: req.user._id }).sort({ createdAt: -1 });
@@ -90,13 +88,10 @@ const startServer = async () => {
   });
 
   // --- 3. Get Messages for a Chat Room Endpoint ---
-  // Method: GET, Path: /chatrooms/:chatRoomId/messages
   app.get('/chatrooms/:chatRoomId/messages', authenticate, async (req, res) => {
     try {
       const chatRoom = await ChatRoom.findOne({ _id: req.params.chatRoomId, userId: req.user._id });
-      if (!chatRoom) {
-        return res.status(404).json({ error: 'Chat room not found or you do not have permission.' });
-      }
+      if (!chatRoom) return res.status(404).json({ error: 'Chat room not found or you do not have permission.' });
       const messages = await Message.find({ chatRoomId: req.params.chatRoomId }).sort({ createdAt: 1 });
       res.status(200).json(messages);
     } catch (error) {
@@ -106,7 +101,6 @@ const startServer = async () => {
   });
 
   // --- 4. Post a New Message Endpoint ---
-  // Method: POST, Path: /chatrooms/:chatRoomId/messages
   app.post('/chatrooms/:chatRoomId/messages', authenticate, async (req, res) => {
     try {
       const { message: userMessage } = req.body;
@@ -114,7 +108,7 @@ const startServer = async () => {
 
       const chatRoom = await ChatRoom.findOne({ _id: req.params.chatRoomId, userId: req.user._id }).populate('documentId');
       if (!chatRoom || !chatRoom.documentId) return res.status(404).json({ error: 'Chat room or associated document not found.' });
-
+      
       await Message.create({ chatRoomId: req.params.chatRoomId, role: 'user', content: userMessage });
       
       const document = chatRoom.documentId;
@@ -135,23 +129,56 @@ const startServer = async () => {
       res.status(500).json({ error: 'Internal server error' });
     }
   });
-
-  // --- 5. Get Document Status Endpoint (for Polling) ---
-  // Method: GET, Path: /documents/:documentId/status
+  
+  // --- 5. Get Document Processing Status Endpoint ---
   app.get('/documents/:documentId/status', authenticate, async (req, res) => {
     try {
-      const document = await Document.findOne({
-        _id: req.params.documentId,
-        userId: req.user._id
-      });
-
-      if (!document) {
-        return res.status(404).json({ error: 'Document not found.' });
-      }
-
+      const document = await Document.findOne({ _id: req.params.documentId, userId: req.user._id });
+      if (!document) return res.status(404).json({ error: 'Document not found.' });
       res.status(200).json({ status: document.status });
     } catch (error) {
       console.error('Error fetching document status:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  // --- 6. Start Podcast Generation Endpoint ---
+  app.post('/documents/:documentId/podcast', authenticate, async (req, res) => {
+    try {
+      const document = await Document.findOne({ _id: req.params.documentId, userId: req.user._id });
+      if (!document) return res.status(404).json({ error: 'Document not found.' });
+      if (document.podcastStatus === 'GENERATING' || document.podcastStatus === 'COMPLETED') {
+      return res.status(409).json({ // 409 Conflict is a good status code here
+        message: 'A podcast is already being generated or has been completed for this document.',
+        status: document.podcastStatus,
+        url: document.podcastUrl,
+      });
+    }
+      if (!document.filePath) return res.status(400).json({ error: 'Document file path not found.' });
+      
+      await queue.add('podcast-generation-job', {
+        documentId: document._id,
+        pdfPath: document.filePath,
+      });
+      res.status(202).json({ message: 'Podcast generation has been started.' });
+    } catch (error) {
+      console.error('Error starting podcast generation:', error);
+      res.status(500).json({ error: 'Internal server error' });
+    }
+  });
+
+  // --- 7. Get Podcast Generation Status Endpoint ---
+  app.get('/documents/:documentId/podcast/status', authenticate, async (req, res) => {
+    try {
+      const document = await Document.findOne({ _id: req.params.documentId, userId: req.user._id });
+      if (!document) return res.status(404).json({ error: 'Document not found.' });
+      
+      res.status(200).json({
+        status: document.podcastStatus,
+        url: document.podcastUrl,
+      });
+    } catch (error) {
+      console.error('Error fetching podcast status:', error);
       res.status(500).json({ error: 'Internal server error' });
     }
   });
@@ -161,5 +188,4 @@ const startServer = async () => {
   app.listen(PORT, () => console.log(`Server started on PORT: ${PORT}`));
 };
 
-// --- Execute the server start function ---
 startServer();

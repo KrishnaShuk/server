@@ -1,20 +1,18 @@
-// server/worker.js
-
 import { Worker } from 'bullmq';
 import dotenv from 'dotenv';
 import { PDFLoader } from '@langchain/community/document_loaders/fs/pdf';
 import { GoogleGenerativeAIEmbeddings } from '@langchain/google-genai';
 import { QdrantVectorStore } from '@langchain/qdrant';
+import { promises as fs } from 'fs';
 
 import connectDB from './config/db.js';
 import Document from './models/document.model.js';
 import ChatRoom from './models/chatRoom.model.js';
-import { promises as fs } from 'fs'; 
+import { aiService } from './services/aiService.js';
+import { ttsService } from './services/ttsService.js';
+import { storageService } from './services/storageService.js';
 
-// Load environment variables
 dotenv.config();
-
-// Establish a database connection for the worker
 connectDB();
 
 const embeddings = new GoogleGenerativeAIEmbeddings({
@@ -23,73 +21,68 @@ const embeddings = new GoogleGenerativeAIEmbeddings({
 });
 
 const worker = new Worker(
-  'file-upload-queue', // Must match the queue name in index.js
+  'file-upload-queue',
   async (job) => {
-    const { path, documentId, qdrantCollectionName } = job.data;
-    console.log(`Processing job ${job.id} for document ${documentId}`);
+    switch (job.name) {
+      case 'file-processing-job': {
+        const { path, documentId, qdrantCollectionName } = job.data;
+        console.log(`Processing file job ${job.id} for document ${documentId}`);
+        try {
+          await Document.findByIdAndUpdate(documentId, { status: 'PROCESSING' });
+          const loader = new PDFLoader(path);
+          const docs = await loader.load();
+          if (docs.length === 0) throw new Error('No content loaded from PDF.');
 
-    try {
-      // 1. Update status to PROCESSING
-      await Document.findByIdAndUpdate(documentId, { status: 'PROCESSING' });
+          await QdrantVectorStore.fromDocuments(docs, embeddings, {
+            url: process.env.QDRANT_URL, apiKey: process.env.QDRANT_API_KEY, collectionName: qdrantCollectionName,
+          });
 
-      // 2. Load the PDF
-      const loader = new PDFLoader(path);
-      const docs = await loader.load();
-      if (docs.length === 0) throw new Error('No content could be loaded from the PDF.');
-      
-      console.log(`Loaded ${docs.length} pages from PDF.`);
-
-      // 3. Create and store embeddings in Qdrant
-      await QdrantVectorStore.fromDocuments(docs, embeddings, {
-        url: process.env.QDRANT_URL,
-        apiKey: process.env.QDRANT_API_KEY,
-        collectionName: qdrantCollectionName,
-      });
-
-      console.log(`Embeddings stored in Qdrant collection: ${qdrantCollectionName}`);
-
-      // 4. On success, update status to COMPLETED and create a chat room
-      const completedDocument = await Document.findByIdAndUpdate(
-        documentId,
-        { status: 'COMPLETED' },
-        { new: true } // Return the updated document
-      );
-      
-      await ChatRoom.create({
-        userId: completedDocument.userId,
-        documentId: completedDocument._id,
-        title: completedDocument.fileName,
-      });
-
-      console.log(`Job ${job.id} completed successfully. Chat room created.`);
-
-      try {
-        await fs.unlink(path);
-        console.log(`Successfully deleted temporary file: ${path}`);
-      } catch (cleanupError) {
-        // If cleanup fails, we just log it. It's not a critical failure
-        // of the job itself, as the main work (embeddings) is done.
-        console.error(`Error during file cleanup for path ${path}:`, cleanupError);
+          const completedDocument = await Document.findByIdAndUpdate(documentId, { status: 'COMPLETED' }, { new: true });
+          await ChatRoom.create({
+            userId: completedDocument.userId, documentId: completedDocument._id, title: completedDocument.fileName,
+          });
+          console.log(`File job ${job.id} completed. Chat room created.`);
+        } catch (error) {
+          console.error(`File job ${job.id} failed for document ${documentId}:`, error);
+          await Document.findByIdAndUpdate(documentId, { status: 'FAILED' });
+        }
+        break;
       }
 
-    } catch (error) {
-      console.error(`Job ${job.id} failed for document ${documentId}:`, error);
-      // On failure, update status to FAILED
-      await Document.findByIdAndUpdate(documentId, { status: 'FAILED' });
+      case 'podcast-generation-job': {
+        const { documentId, pdfPath } = job.data;
+        console.log(`Generating podcast job ${job.id} for document ${documentId}`);
+        try {
+          await Document.findByIdAndUpdate(documentId, { podcastStatus: 'GENERATING' });
+
+          const script = await aiService.generateScriptFromPDF(pdfPath);
+          if (!script) throw new Error("Script generation failed.");
+
+          const audioBuffer = await ttsService.textToAudioBuffer(script);
+          if (!audioBuffer) throw new Error("TTS conversion failed.");
+
+          const podcastUrl = await storageService.uploadAudio(audioBuffer, documentId);
+if (!podcastUrl) throw new Error("Audio upload failed.");
+
+          await Document.findByIdAndUpdate(documentId, { podcastStatus: 'COMPLETED', podcastUrl: podcastUrl });
+          console.log(`Podcast job ${job.id} successful for document ${documentId}`);
+
+          try {
+            await fs.unlink(pdfPath);
+            console.log(`Successfully deleted temporary file after podcast: ${pdfPath}`);
+          } catch (cleanupError) {
+            console.error(`Error during post-podcast file cleanup:`, cleanupError);
+          }
+        } catch (error) {
+          console.error(`Podcast job ${job.id} failed for document ${documentId}:`, error);
+          await Document.findByIdAndUpdate(documentId, { podcastStatus: 'FAILED' });
+        }
+        break;
+      }
+      default:
+        console.warn(`Worker received unknown job type: ${job.name}`);
     }
-  },
-  {
-    // Connection details for BullMQ
-    connection: {
-      host: process.env.REDIS_HOST,
-      port: parseInt(process.env.REDIS_PORT, 10),
-      password: process.env.REDIS_PASSWORD,
-      tls: {},
-    },
-    concurrency: 5, // Process up to 5 jobs concurrently
-    removeOnComplete: { count: 1000 }, // Keep logs for last 1000 jobs
-    removeOnFail: { count: 5000 }, // Keep logs for last 5000 failed jobs
-  }
+  }, { connection: { host: process.env.REDIS_HOST, port: parseInt(process.env.REDIS_PORT, 10), password: process.env.REDIS_PASSWORD, tls: {} }, concurrency: 5, removeOnComplete: { count: 1000 }, removeOnFail: { count: 5000 } }
 );
 
 console.log('Worker is listening for jobs...');
