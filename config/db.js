@@ -2,8 +2,10 @@
 
 import mongoose from 'mongoose';
 import dotenv from 'dotenv';
+import expand from 'dotenv-expand';
 
-dotenv.config(); // Load environment variables from .env file
+const myEnv = dotenv.config();
+expand.expand(myEnv); // Load environment variables from .env file
 
 const connectDB = async () => {
   try {

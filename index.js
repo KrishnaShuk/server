@@ -5,6 +5,7 @@ import cors from 'cors';
 import multer from 'multer';
 import { Queue } from 'bullmq';
 import dotenv from 'dotenv';
+import expand from 'dotenv-expand';
 import mongoose from 'mongoose';
 
 // Local Imports
@@ -19,7 +20,8 @@ import { GoogleGenerativeAIEmbeddings, ChatGoogleGenerativeAI } from '@langchain
 import { QdrantVectorStore } from '@langchain/qdrant';
 
 const startServer = async () => {
-  dotenv.config();
+  const myEnv = dotenv.config();
+expand.expand(myEnv);
   await connectDB();
 
   const app = express();

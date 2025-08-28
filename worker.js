@@ -1,5 +1,6 @@
 import { Worker } from 'bullmq';
 import dotenv from 'dotenv';
+import expand from 'dotenv-expand';
 import { PDFLoader } from '@langchain/community/document_loaders/fs/pdf';
 import { GoogleGenerativeAIEmbeddings } from '@langchain/google-genai';
 import { QdrantVectorStore } from '@langchain/qdrant';
@@ -12,7 +13,8 @@ import { aiService } from './services/aiService.js';
 import { ttsService } from './services/ttsService.js';
 import { storageService } from './services/storageService.js';
 
-dotenv.config();
+const myEnv = dotenv.config();
+expand.expand(myEnv);
 connectDB();
 
 const embeddings = new GoogleGenerativeAIEmbeddings({
