@@ -3,8 +3,8 @@
 import express from 'express';
 import cors from 'cors';
 import multer from 'multer';
-import { S3Client } from '@aws-sdk/client-s3'; // For R2 Cloud Storage
-import multerS3 from 'multer-s3';             // Multer's S3 storage engine
+import { S3Client } from '@aws-sdk/client-s3';
+import multerS3 from 'multer-s3';
 import { Queue } from 'bullmq';
 import dotenv from 'dotenv';
 import mongoose from 'mongoose';
@@ -30,7 +30,7 @@ const startServer = async () => {
   app.use(cors(corsOptions));
   app.use(express.json());
 
-  // --- NEW: CONFIGURE S3 CLIENT FOR CLOUDFLARE R2 ---
+  // Configure the S3 client for Cloudflare R2
   const s3 = new S3Client({
     region: "auto",
     endpoint: process.env.R2_ENDPOINT,
@@ -40,16 +40,14 @@ const startServer = async () => {
     },
   });
 
-  // --- NEW: CONFIGURE MULTER TO UPLOAD DIRECTLY TO R2 ---
+  // Configure multer to upload to R2
   const upload = multer({
     storage: multerS3({
       s3: s3,
       bucket: process.env.R2_BUCKET_NAME,
-      acl: 'public-read', // Make the uploaded file publicly accessible for the worker
+      // acl: 'public-read', // This is not needed for R2 and is removed.
       key: function (req, file, cb) {
-        // Create a unique filename for the object in the R2 bucket
         const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1e9);
-        // Store original uploads in a dedicated "uploads" folder within the bucket
         cb(null, `uploads/${uniqueSuffix}-${file.originalname}`);
       }
     })
@@ -66,23 +64,27 @@ const startServer = async () => {
     try {
       if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
       
-      const { originalname, location } = req.file;
+      // The `req.file` object from multer-s3 contains the `key` of the object in the bucket.
+      const { originalname, key } = req.file;
+
+      // --- THE FIX: Manually construct the correct, truly public URL ---
+      const publicUrl = `${process.env.R2_PUBLIC_URL}/${key}`;
       
       const newDocument = await Document.create({
         userId: req.user._id,
         fileName: originalname,
-        filePath: location, // Save the public R2 URL
+        filePath: publicUrl, // Save the correct public URL
         status: 'PENDING',
         qdrantCollectionName: new mongoose.Types.ObjectId().toHexString(),
       });
       
       await queue.add('file-processing-job', {
-        path: location, // Pass the public URL to the worker
+        path: publicUrl, // Pass the correct public URL to the worker
         documentId: newDocument._id,
         qdrantCollectionName: newDocument.qdrantCollectionName,
       });
       
-      console.log(`Job added for document ${newDocument._id} from URL ${location}`);
+      console.log(`Job added for document ${newDocument._id} from URL ${publicUrl}`);
       return res.status(201).json({ documentId: newDocument._id });
     } catch (error) {
       console.error('Error during file upload:', error);
@@ -165,7 +167,7 @@ const startServer = async () => {
       
       await queue.add('podcast-generation-job', {
         documentId: document._id,
-        pdfPath: document.filePath, // Use the stored public R2 URL
+        pdfPath: document.filePath,
       });
 
       res.status(202).json({ message: 'Podcast generation has been started.' });
